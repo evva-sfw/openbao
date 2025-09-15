@@ -11,6 +11,7 @@ import (
 	"github.com/hashicorp/cli"
 	"github.com/openbao/openbao/audit"
 	"github.com/openbao/openbao/builtin/plugin"
+	"github.com/openbao/openbao/plugins/azuretable"
 	"github.com/openbao/openbao/sdk/v2/logical"
 	"github.com/openbao/openbao/sdk/v2/physical"
 	"github.com/openbao/openbao/version"
@@ -148,11 +149,12 @@ var (
 	}
 
 	physicalBackends = map[string]physical.Factory{
-		"file":       physFile.NewFileBackend,
-		"inmem_ha":   physInmem.NewInmemHA,
-		"inmem":      physInmem.NewInmem,
-		"raft":       physRaft.NewRaftBackend,
-		"postgresql": physPostgresql.NewPostgreSQLBackend,
+		"file":           physFile.NewFileBackend,
+		"inmem_ha":       physInmem.NewInmemHA,
+		"inmem":          physInmem.NewInmem,
+		"raft":           physRaft.NewRaftBackend,
+		"postgresql":     physPostgresql.NewPostgreSQLBackend,
+		"azuredatatable": azuretable.NewAzureTableBackend,
 	}
 
 	serviceRegistrations = map[string]sr.Factory{
