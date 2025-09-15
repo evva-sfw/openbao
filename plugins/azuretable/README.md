@@ -47,19 +47,6 @@ Example stored entity:
   "OrigKey": "namespaces/6d44e0a5-9140-1e9d-26a9-774cc34e3308/logical/foo/bar"
 }
 ```
- 
-## Installation
-
-Add this package to your Go project:
-
-```bash
-go get github.com/your-org/azuretable
-```
-
-Import it in your code:
-```bash
-import "github.com/your-org/azuretable"
-```
 
 ## Configuration
 
