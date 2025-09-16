@@ -50,24 +50,66 @@ Example stored entity:
 
 ## Configuration
 
+This backend supports three ways to authenticate to Azure Table Storage:
+
+1) **Shared Key**
+   - `account_name`, `account_key`, `service_url`, `table_name` (all required)
+   - The backend creates the table on startup (idempotent).
+   - Example `service_url`: `https://<account>.table.core.windows.net`
+
+2) **Azure AD (client credentials)**
+   - `tenant_id`, `client_id`, `client_secret`, `table_url` (all required)
+   - The backend **does not** create the table in this mode; ensure the table already exists assuming the principal has `Table Service Contributor` rights (or equivalent).
+   - Example `table_url`: `https://<account>.table.core.windows.net/tableName`
+
+3) **SAS URL**
+   - `sas_url` (required)
+   - **Recommended:** a *table-scoped* SAS URL like `https://<account>.table.core.windows.net/<table>?<sas>`.
+   - The backend **does not** create the table in this mode; ensure the table already exists and the SAS has the required permissions (at least `raud` for read/add/update/delete).
+
 The backend requires the following configuration parameters:
-| Key                     | Description                                                                      | Required | Default |
-| ----------------------- | -------------------------------------------------------------------------------- | -------- | ------- |
-| `account_name`          | Azure Storage account name                                                       | Yes      | -       |
-| `account_key`           | Azure Storage account key                                                        | Yes      | -       |
-| `table_name`            | Table name to store secrets                                                      | Yes      | -       |
-| `service_url`           | Full Azure Table endpoint URL (e.g., `https://<account>.table.core.windows.net`) | Yes      | -       |
-| `max_connect_retries`   | Max retries for creating the service client & table (startup)                    | No       | `1`     |
-| `max_operation_retries` | Max retries for runtime operations (Put/Delete/List)                             | No       | `1`     |
+| Key                     | Description                                                                                     | Required (per auth method) | Default |
+| ----------------------- | ----------------------------------------------------------------------------------------------- | -------------------------- | ------- |
+| `account_name`          | Azure Storage account name                                                                      | Shared Key                 | -       |
+| `account_key`           | Azure Storage account key                                                                       | Shared Key                 | -       |
+| `table_name`            | Table to store secrets (auto-created in Shared Key mode only)                                   | Shared Key                 | -       |
+| `service_url`           | Service endpoint, e.g. `https://<acct>.table.core.windows.net`                                  | Shared Key                 | -       |
+| `tenant_id`             | Azure Active Directory tenant GUID for authentication                                           | Azure AD                   | -       |
+| `client_id`             | Azure AD application (service principal) client ID                                              | Azure AD                   | -       |
+| `client_secret`         | Azure AD client secret                                                                          | Azure AD                   | -       |
+| `table_url`             | Table endpoint e.g., `https://<account>.table.core.windows.net`                                 | Azure AD                   | -       |
+| `sas_url`               | Full SAS URL (must be table-scoped), e.g. `https://<acct>.table.core.windows.net/<table>?<sas>` | SAS URL                    | -       |
+| `max_connect_retries`   | Max retries for creating the service client & table (startup)                                   | Optional                   | `1`     |
+| `max_operation_retries` | Max retries for runtime operations (Put/Delete/List)                                            | Optional                   | `1`     |
 
 Example OpenBao Configuration (HCL):
+# Shared Key
 ```hcl
 storage "azuretable" {
-  account_name          = "myaccount"
-  account_key           = "mysecretkey"
-  table_name            = "openbao-secrets"
-  service_url           = "https://myaccount.table.core.windows.net"
+  account_name          = "..."
+  account_key           = "..."
+  service_url           = "https://<account>.table.core.windows.net"
+  table_name            = "OpenBaoSecrets"
   max_connect_retries   = "5"
+  max_operation_retries = "3"
+}
+```
+
+# Azure AD (client credentials)
+```hcl
+storage "azuretable" {
+  tenant_id             = "<tenant-guid>"
+  client_id             = "<app-guid>"
+  client_secret         = "<secret>"
+  table_url             = "https://<account>.table.core.windows.net/OpenBaoSecrets"
+  max_operation_retries = "3"
+}
+```
+
+# SAS URL (table-scoped)
+```hcl
+storage "azuretable" {
+  sas_url               = "https://<account>.table.core.windows.net/OpenBaoSecrets?<sas>"
   max_operation_retries = "3"
 }
 ```

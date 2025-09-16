@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/cenkalti/backoff/v4"
 	log "github.com/hashicorp/go-hclog"
@@ -39,25 +41,50 @@ type rawEntity struct {
 }
 
 /*
-NewAzureTableBackend initializes the Azure Table backend with the provided
-configuration and returns a Backend interface instance.
+NewAzureTableBackend initializes the Azure Table backend and returns a Backend interface instance.
 
-The configuration map `conf` must include:
-  - account_name: Azure Storage account name
-  - account_key: Azure Storage account key
-  - table_name: Table to use for storing secrets
-  - service_url: Full URL of the Azure Table service endpoint
-  - max_connect_retries: Maximum number of retry attempts for both creating the service client and creating the table on startup
+Authentication / connection modes (exactly one must be provided):
 
-The function will attempt to create the service client and the table,
-retrying transient failures up to `max_connect_retries` times with
-exponential backoff. If the table already exists, it is not treated as an error.
+ 1. Shared Key (service-scoped URL; table may be created on startup)
+    Required keys:
+    - account_name     : Azure Storage account name
+    - account_key      : Azure Storage account key
+    - service_url      : https://<account>.table.core.windows.net
+    - table_name       : name of the table to use
+    Behavior:
+    - Attempts to create 'table_name' on startup (idempotent; retried up to max_connect_retries).
+
+ 2. Azure AD (client credentials, table-scoped URL; table must already exist)
+    Required keys:
+    - tenant_id        : AAD tenant ID (GUID)
+    - client_id        : AAD application (client) ID
+    - client_secret    : AAD client secret
+    - table_url        : https://<account>.table.core.windows.net/<table>
+    Behavior:
+    - No table creation is attempted; 'table_url' must reference an existing table.
+
+ 3. SAS URL (table-scoped URL; table must already exist)
+    Required keys:
+    - sas_url          : https://<account>.table.core.windows.net/<table>?<sas>
+    Behavior:
+    - No table creation is attempted; SAS must carry required permissions (e.g., raud).
+
+Common options:
+  - max_connect_retries   : retries for client/table creation (default: 1)
+  - max_operation_retries : retries for runtime ops (Put/Delete/List) (default: 1)
 */
 func NewAzureTableBackend(conf map[string]string, logger log.Logger) (physical.Backend, error) {
 	accountName := conf["account_name"]
 	accountKey := conf["account_key"]
 	tableName := conf["table_name"]
-	serviceURL := conf["service_url"]
+	serviceURL := conf["service_url"] // service endpoint: https://<acct>.table.core.windows.net
+
+	tenantID := conf["tenant_id"]
+	clientID := conf["client_id"]
+	clientSecret := conf["client_secret"]
+	tableURL := conf["table_url"] // table endpoint: https://<acct>.table.core.windows.net/tablename
+
+	sasURL := conf["sas_url"] // full table or service SAS URL
 
 	// Set maximum retries for DB connection liveness check on startup.
 	maxRetriesStr, ok := conf["max_connect_retries"]
@@ -90,18 +117,65 @@ func NewAzureTableBackend(conf map[string]string, logger log.Logger) (physical.B
 		maxOpRetriesInt = 1
 	}
 
-	service, err := createServiceClientWithRetry(accountName, accountKey, serviceURL, maxRetriesInt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Azure Table client: %w", err)
+	// Creating the Client
+	var tableClient *aztables.Client
+	// 1) Shared Key
+	if accountName != "" && accountKey != "" && tableName != "" && serviceURL != "" {
+		logger.Info("azuretable: using Shared Key auth")
+		service, err := createServiceClientWithRetry(accountName, accountKey, serviceURL, maxRetriesInt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create service client (shared key): %w", err)
+		}
+
+		err = createTableWithRetry(context.Background(), service, tableName, maxRetriesInt, logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create table after retries: %w", err)
+		}
+
+		tableClient = service.NewClient(tableName)
+
+		// 2) AAD Client Secret (table must exist)
+	} else if tenantID != "" && clientID != "" && clientSecret != "" && tableURL != "" {
+		logger.Info("azuretable: using AAD client secret auth")
+		cred, err := azidentity.NewClientSecretCredential(tenantID, clientID, clientSecret, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create AAD credential: %w", err)
+		}
+
+		tableClient, err = aztables.NewClient(tableURL, cred, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create client (AAD): %w", err)
+		}
+
+		// Derive tableName for bookkeeping if not provided
+		if tableName == "" {
+			tableName = lastPathSegment(tableURL)
+		}
+
+		// 3) SAS URL (table must exist; SAS must be table-scoped)
+	} else if sasURL != "" {
+		logger.Info("azuretable: using SAS URL auth")
+		// sasURL should already points to the TABLE endpoint
+		tableClient, err = aztables.NewClientWithNoCredential(sasURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create table client (SAS URL): %w", err)
+		}
+
+		if tableName == "" {
+			tableName = lastPathSegment(sasURL)
+		}
+
+	} else {
+		return nil, fmt.Errorf(
+			"azuretable: insufficient configuration: " +
+				"provide either (account_name+account_key+service_url+table_name) or " +
+				"(tenant_id+client_id+client_secret+table_url) or " +
+				"(sas_url)")
 	}
 
-	err = createTableWithRetry(context.Background(), service, tableName, maxRetriesInt, logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create table after retries: %w", err)
+	if logger.IsDebug() {
+		logger.Debug("azuretable: initialized client", "table", tableName)
 	}
-
-	// Create a client scoped to the specific table
-	tableClient := service.NewClient(tableName)
 
 	return &AzureTableBackend{
 		client:           tableClient,
@@ -132,7 +206,6 @@ func createServiceClientWithRetry(accountName, accountKey, serviceURL string, ma
 			err = fmt.Errorf("failed to create credentials: %w", credErr)
 			return err
 		}
-
 		service, err = aztables.NewServiceClientWithSharedKey(serviceURL, cred, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create Azure Table service client: %w", err)
@@ -196,7 +269,7 @@ func (b *AzureTableBackend) Get(ctx context.Context, key string) (*physical.Entr
 	err = json.Unmarshal(resp.Value, &properties)
 	if err != nil {
 		// Could be raw bytes or opaque value, just return as-is
-		fmt.Println("failed to unmarshal entity properties, returning raw value for key", key)
+		b.logger.Info("failed to unmarshal entity properties, returning raw value for key", key)
 		return &physical.Entry{
 			Key:   key,
 			Value: resp.Value,
@@ -262,7 +335,7 @@ func (b *AzureTableBackend) Put(ctx context.Context, entry *physical.Entry) erro
 		return fmt.Errorf("failed to upsert key '%s' after retries: %w", entry.Key, err)
 	}
 
-	fmt.Printf("Successfully upserted key '%s'.\n", entry.Key)
+	b.logger.Info("Successfully upserted key '%s'.\n", entry.Key)
 	return nil
 }
 
@@ -276,16 +349,16 @@ func (b *AzureTableBackend) Delete(ctx context.Context, key string) error {
 		var respErr *azcore.ResponseError
 		if errors.As(err, &respErr) && respErr.StatusCode == http.StatusNotFound {
 			// 404 Not Found means the entity was already deleted, treat as success
-			fmt.Printf("Key '%s' already not found, treating as a successful deletion.\n", key)
+			b.logger.Info("Key '%s' already not found, treating as a successful deletion.\n", key)
 			return nil
 		}
 
 		// Any other error is returned to caller
-		fmt.Printf("Error deleting key '%s': %v\n", key, err)
+		b.logger.Error("Error deleting key '%s': %v\n", key, err)
 		return err
 	}
 
-	fmt.Printf("Successfully deleted key '%s'.\n", key)
+	b.logger.Info("Successfully deleted key '%s'.\n", key)
 	return nil
 }
 
@@ -316,7 +389,7 @@ func (b *AzureTableBackend) List(ctx context.Context, prefix string) ([]string, 
 		for _, entityJSON := range page.Entities {
 			var props map[string]any
 			if err := json.Unmarshal(entityJSON, &props); err != nil {
-				fmt.Println("failed to unmarshal entity, skipping")
+				b.logger.Info("failed to unmarshal entity, skipping")
 				continue
 			}
 
@@ -358,7 +431,6 @@ func (b *AzureTableBackend) List(ctx context.Context, prefix string) ([]string, 
 		keys = append(keys, k)
 	}
 
-	fmt.Printf("Found %d keys.\n", len(keys))
 	return keys, nil
 }
 
@@ -395,7 +467,7 @@ func (b *AzureTableBackend) ListPage(ctx context.Context, prefix, after string, 
 		for _, entityJSON := range page.Entities {
 			var props map[string]any
 			if err := json.Unmarshal(entityJSON, &props); err != nil {
-				fmt.Println("failed to unmarshal entity, skipping")
+				b.logger.Info("failed to unmarshal entity, skipping")
 				continue
 			}
 
@@ -443,7 +515,6 @@ func (b *AzureTableBackend) ListPage(ctx context.Context, prefix, after string, 
 		keys = keys[:limit]
 	}
 
-	fmt.Printf("Found %d keys in ListPage.\n", len(keys))
 	return keys, nil
 }
 
@@ -516,4 +587,19 @@ func safeRowKey(rowKey string) string {
 // therefore it is required to do the convert when trying to `GET` entity
 func revertSafeRowKey(rowKey string) string {
 	return strings.ReplaceAll(rowKey, "+", "/")
+}
+
+// lastPathSegment returns the last non-empty path segment from a URL string.
+// If it cannot parse or no segment, returns "".
+func lastPathSegment(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	trimmed := strings.Trim(u.Path, "/")
+	if trimmed == "" {
+		return ""
+	}
+	parts := strings.Split(trimmed, "/")
+	return parts[len(parts)-1]
 }
