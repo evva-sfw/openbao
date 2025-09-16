@@ -12,7 +12,11 @@ This plugin provides a **physical storage backend** for [OpenBao](https://github
 
 ### Key Features
 - **Integration with Azure Table Storage** using the official [`aztables`](https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/sdk/data/aztables) SDK.
-- **Automatic table creation** on startup if it does not exist.
+- **Multiple authentication modes**:
+  - Shared Key (auto-creates table on startup)
+  - Azure AD Client Credentials (service principal)
+  - Table-scoped SAS URL
+- **Automatic table creation** when using Shared Key authentication.
 - **Exponential backoff retries** for service client and table operations.
 - **Prefix-based hierarchical listing** and pagination support.
 - **Graceful handling of missing keys** (404 returns `nil` instead of error).
@@ -165,8 +169,7 @@ keys, err := backend.ListPage(ctx, "foo/", "afterKey", 10)
 
 ## Key Encoding
 
-- The **RowKey** is no longer the raw OpenBao path.  
-  Instead, it is `sha256(original_key)` encoded as a hex string.  
+- The **RowKey** is `sha256(original_key)` encoded as a hex string.  
   This avoids Azure length/character restrictions and keeps keys short.
 
 - The **OrigKey** field always contains the full original path, so listing and prefix matching work as expected.
