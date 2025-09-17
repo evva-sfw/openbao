@@ -174,7 +174,7 @@ keys, err := backend.ListPage(ctx, "foo/", "afterKey", 10)
 
 - The **OrigKey** field always contains the full original path, so listing and prefix matching work as expected.
 
-- `safeRowKey` / `revertSafeRowKey` are still used internally for partition names (e.g., `secrets-<nsID>`), but not for RowKeys.
+- `safeRowKey` / `revertSafeRowKey` are used internally for partition names (e.g., `secrets-<nsID>`).
 
 ## Logging
 
